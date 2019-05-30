@@ -579,7 +579,7 @@ our role Native[Routine $r, $libname where Str|Callable|List|IO::Path|Distributi
         if nqp::elems($args) != $!arity {
             X::TypeCheck::Argument.new(
                 :objname($.name),
-                :arguments(args.list.map(*.^name))
+                :arguments(args.list.map(*.^name)),
                 :signature(try $r.signature.gist),
             ).throw
         }
@@ -597,7 +597,7 @@ multi sub postcircumfix:<[ ]>(CArray:D \array, *@pos) is raw is export(:DEFAULT,
 multi sub postcircumfix:<[ ]>(CArray:D \array, Callable:D $block) is raw is export(:DEFAULT, :types) {
     nqp::stmts(
       (my $*INDEX = 'Effective index'),
-      array[$block.pos(array)]
+      array[$block.POSITIONS(array)]
     )
 }
 multi sub postcircumfix:<[ ]>(CArray:D \array) is export(:DEFAULT, :types) {

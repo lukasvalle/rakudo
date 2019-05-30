@@ -176,10 +176,26 @@ my class List does Iterable does Positional { # declared in BOOTSTRAP
         }
 
         method is-lazy() {
-            nqp::if(
-              nqp::isconcrete($!current-iter),
-              $!current-iter.is-lazy,
-              False
+            nqp::unless(
+              nqp::isconcrete($!current-iter) && $!current-iter.is-lazy,
+              nqp::if(
+                nqp::isconcrete($!future),
+                nqp::stmts( # Check $!future to determine if any element is lazy
+                  (my \iter := nqp::iterator($!future)),
+                  nqp::while(
+                    iter
+                      && nqp::can((my $cur := nqp::shift(iter)),'is-lazy')
+                      && nqp::isfalse($cur.is-lazy),
+                    nqp::null
+                  ),
+                  nqp::if(
+                    iter,
+                    True,          # did not did do all iterations, so lazy
+                    $cur.is-lazy   # check last one, could be non-lazy
+                  )
+                ),
+                False
+              )
             )
         }
     }
@@ -851,10 +867,27 @@ my class List does Iterable does Positional { # declared in BOOTSTRAP
 
     multi method perl(List:D \SELF: --> Str:D) {
         SELF.perlseen('List', {
-            '$' x nqp::iscont(SELF) ~ '('
-            ~ (self.elems == 1 ?? self[0].perl ~ ',' !! self.map({.perl}).join(', '))
-            ~ ' ' x nqp::istrue(self.not && nqp::iscont(SELF)) # add space to avoid `$()`
-            ~ ')'
+            my $prefix := nqp::iscont(SELF) ?? '$(' !! '(';
+            if self.is-lazy {
+                my @elements = self.head(101);
+                if @elements > 100 {
+                    @elements.pop;
+                    $prefix ~ @elements.map({.perl}).join(', ') ~ '...).lazy';
+                }
+                else {
+                    $prefix ~ @elements.map({.perl}).join(', ') ~ ').lazy';
+                }
+            }
+            elsif self.elems -> $elems {
+                $prefix ~ (
+                  $elems == 1
+                    ?? self[0].perl ~ ',)'
+                    !! self.map( {.perl} ).join(', ') ~ ')'
+                )
+            }
+            else {
+                $prefix ~ (nqp::iscont(SELF) ?? ' )' !! ')')
+            }
         })
     }
 
@@ -1466,7 +1499,7 @@ my class List does Iterable does Positional { # declared in BOOTSTRAP
                   ),
                   nqp::unless(
                     nqp::istype($n,Whatever) || $n == Inf,
-                    $iterator.skip-at-least(nqp::elems($!reified) - $n)
+                    $iterator.skip-at-least(nqp::elems($!reified) - $n.Int)
                   )
                 ),
                 $iterator

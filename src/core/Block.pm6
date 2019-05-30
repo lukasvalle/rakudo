@@ -78,7 +78,8 @@ my class Block { # declared in BOOTSTRAP
     }
 
     # helper method for array slicing
-    method pos(Block:D $self: \list) {
+    multi method POSITIONS(Block:D: Failure:D \failure) { failure }
+    multi method POSITIONS(Block:D $self: Any:D \list) {
       nqp::if(
         (nqp::istype(
           (my \n := nqp::getattr(

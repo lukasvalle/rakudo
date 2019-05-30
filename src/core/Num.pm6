@@ -197,7 +197,10 @@ my class Num does Real { # declared in BOOTSTRAP
     multi method asinh(Num:D: ) {
         nqp::isnanorinf(self)
             ?? self
-            !! (self + (self * self + 1e0).sqrt).log;
+            !!
+                self >= 0
+                    ?? (self + (self * self + 1e0).sqrt).log
+                    !! -(-1e0 * self).asinh
     }
     proto method cosh(|) {*}
     multi method cosh(Num:D: ) {
@@ -296,9 +299,8 @@ multi sub postfix:<++>(Num:D $a is rw) {
     $a = nqp::p6box_n(nqp::add_n(nqp::unbox_n($a), 1e0));
     $b
 }
-multi sub postfix:<++>(Num:U $a is rw) {
+multi sub postfix:<++>(Num:U $a is rw --> 0e0) {
     $a = 1e0;
-    0e0
 }
 multi sub postfix:<++>(num $a is rw --> num) {
     my num $b = $a;
@@ -310,9 +312,8 @@ multi sub postfix:<-->(Num:D $a is rw) {
     $a = nqp::p6box_n(nqp::sub_n(nqp::unbox_n($a), 1e0));
     $b
 }
-multi sub postfix:<-->(Num:U $a is rw) {
+multi sub postfix:<-->(Num:U $a is rw --> 0e0) {
     $a = -1e0;
-    0e0
 }
 multi sub postfix:<-->(num $a is rw --> num) {
     my num $b = $a;
@@ -561,12 +562,14 @@ multi sub asinh(num $x --> num) {
     # ln(x + √(x²+1))
     nqp::isnanorinf($x)
         ?? $x
-        !! nqp::log_n(
-            nqp::add_n(
-                $x,
-                nqp::pow_n( nqp::add_n(nqp::mul_n($x,$x), 1e0), .5e0 )
+        !! $x >= 0
+            ?? nqp::log_n(
+                nqp::add_n(
+                    $x,
+                    nqp::pow_n( nqp::add_n(nqp::mul_n($x,$x), 1e0), .5e0 )
+                )
             )
-        )
+            !! -asinh(-$x);
 }
 
 multi sub cosh(num $x --> num) {

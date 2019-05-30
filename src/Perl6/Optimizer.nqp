@@ -419,6 +419,8 @@ my class BlockVarOptimizer {
     # Hash mapping variable names declared in the block to the QAST::Var
     # of its declaration.
     has %!decls;
+    # Retain the order of variable declarations.
+    has @!decls;
 
     # Usages of variables in this block, or unioned in from an inlined
     # immediate block.
@@ -450,6 +452,9 @@ my class BlockVarOptimizer {
     # If p6bindsig is used.
     has int $!uses_bindsig;
 
+    # If p6return is used
+    has int $!uses_p6return;
+
     # If we're currently inside a handler argument of an nqp::handle. These
     # are code-gen'd with an implicit block around them, so we mustn't lower
     # lexicals referenced in them to locals.
@@ -460,6 +465,19 @@ my class BlockVarOptimizer {
         my str $scope := $var.scope;
         if $scope eq 'lexical' || $scope eq 'lexicalref' {
             %!decls{$var.name} := $var;
+            nqp::push(@!decls, $var);
+        }
+    }
+
+    method remove_decl(str $name) {
+        nqp::deletekey(%!decls, $name);
+        my int $i := 0;
+        for @!decls {
+            if $_.name eq $name {
+                nqp::splice(@!decls, [], $i, 1);
+                return;
+            }
+            $i++;
         }
     }
 
@@ -503,6 +521,8 @@ my class BlockVarOptimizer {
 
     method uses_bindsig() { $!uses_bindsig := 1; }
 
+    method uses_p6return() { $!uses_p6return := 1; }
+
     method entering_handle_handler() { $!in_handle_handler++; }
 
     method leaving_handle_handler() { $!in_handle_handler--; }
@@ -518,6 +538,10 @@ my class BlockVarOptimizer {
     method get_calls() { $!calls }
 
     method is_poisoned() { $!poisoned }
+
+    method is_inlineable() {
+        !($!poisoned || $!uses_p6return)
+    }
 
     method get_escaping_handler_vars() {
         my @esc;
@@ -599,7 +623,7 @@ my class BlockVarOptimizer {
                     unless nqp::existskey(%!usages_flat, '$_') || nqp::existskey(%!usages_inner, '$_') {
                         if !@!getlexouter_usages {
                             %kill<$_> := 1;
-                            nqp::deletekey(%!decls, '$_');
+                            self.remove_decl('$_');
                         }
                         elsif nqp::elems(@!getlexouter_usages) == 1 {
                             my $glob := @!getlexouter_usages[0];
@@ -608,7 +632,7 @@ my class BlockVarOptimizer {
                                 $glob.op('null');
                                 $glob.shift(); $glob.shift();
                                 %kill<$_> := 1;
-                                nqp::deletekey(%!decls, '$_');
+                                self.remove_decl('$_');
                             }
                         }
                     }
@@ -622,19 +646,19 @@ my class BlockVarOptimizer {
             if nqp::existskey(%!decls, '$/') {
                 if !nqp::existskey(%!usages_flat, '$/') && !nqp::existskey(%!usages_inner, '$/') {
                     %kill<$/> := 1;
-                    nqp::deletekey(%!decls, '$/');
+                    self.remove_decl('$/');
                 }
             }
             if nqp::existskey(%!decls, '$!') {
                 if !nqp::existskey(%!usages_flat, '$!') && !nqp::existskey(%!usages_inner, '$!') {
                     %kill<$!> := 1;
-                    nqp::deletekey(%!decls, '$!');
+                    self.remove_decl('$!');
                 }
             }
             if nqp::existskey(%!decls, '$¢') {
                 if !nqp::existskey(%!usages_flat, '$¢') && !nqp::existskey(%!usages_inner, '$¢') {
                     %kill<$¢> := 1;
-                    nqp::deletekey(%!decls, '$¢');
+                    self.remove_decl('$¢');
                 }
             }
         }
@@ -681,9 +705,8 @@ my class BlockVarOptimizer {
     method lexical_vars_to_locals($block, $LoweredAwayLexical, $can_lower_topic) {
         return 0 if $!poisoned || $!uses_bindsig;
         return 0 unless nqp::istype($block[0], QAST::Stmts);
-        for %!decls {
+        for @!decls -> $qast {
             # We're looking for lexical var/contvar decls.
-            my $qast := $_.value;
             my str $scope := $qast.scope;
             next unless $scope eq 'lexical';
             my str $decl := $qast.decl;
@@ -706,7 +729,7 @@ my class BlockVarOptimizer {
 
             # Consider name. Can't lower if it's used by any nested blocks or
             # in an nqp::handlers handler.
-            my str $name := $_.key;
+            my str $name := $qast.name;
             unless nqp::existskey(%!usages_inner, $name) ||
                     nqp::existskey(%!used_in_handle_handler, $name) {
                 # Lowerable if it's a normal variable, including $_ if we're in a
@@ -808,8 +831,9 @@ my class BlockVarOptimizer {
                     }
                 }
 
-                # Stash the name we lowered it to.
+                # Stash the name we lowered it to, and add a debug mapping.
                 $block.symbol($name, :lowered($new_name));
+                $block.add_local_debug_mapping($new_name, $name);
             }
         }
     }
@@ -1122,7 +1146,7 @@ class Perl6::Optimizer {
         my int $flattened := 0;
         my $result := $block;
         if $!level >= 2 && $block.blocktype eq 'immediate' && $block.arity == 0
-                && !$vars_info.is_poisoned && !$block.has_exit_handler {
+                && $vars_info.is_inlineable && !$block.has_exit_handler {
             # Scan symbols for any non-lowered ones.
             my $impossible := 0;
             for $block.symtable() {
@@ -1497,6 +1521,9 @@ class Perl6::Optimizer {
         }
         elsif $optype eq 'p6bindsig' || $optype eq 'p6bindcaptosig' {
             @!block_var_stack[nqp::elems(@!block_var_stack) - 1].uses_bindsig();
+        }
+        elsif $optype eq 'p6return' {
+            @!block_var_stack[nqp::elems(@!block_var_stack) - 1].uses_p6return();
         }
         elsif $optype eq 'call' || $optype eq 'callmethod' || $optype eq 'chain' {
             @!block_var_stack[nqp::elems(@!block_var_stack) - 1].register_call();
@@ -2472,7 +2499,9 @@ class Perl6::Optimizer {
             QAST::Var.new(
               :name($it_var), :scope<local>, :decl<var>, :returns(int)
             ),
-            QAST::Op.new( :op<sub_i>, $start, QAST::IVal.new( :value($step)))
+            nqp::istype($start, QAST::IVal)
+                ?? QAST::IVal.new( :value($start.value - $step) )
+                !! QAST::Op.new( :op<sub_i>, $start, QAST::IVal.new( :value($step)))
           ),
 
 # my int $last := $end
@@ -3014,6 +3043,11 @@ class Perl6::Optimizer {
             else {
                 @copy_decls.push($_);
             }
+        }
+
+        # Copy local debug name mappings.
+        for $block.local_debug_map {
+            $outer.add_local_debug_mapping($_.key, $_.value);
         }
 
         # Hand back the decls and statements that we're inlining.

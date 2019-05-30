@@ -4,6 +4,8 @@ my class Regex { # declared in BOOTSTRAP
     #     has Mu $!nfa;
     #     has %!alt_nfas;
     #     has str $!source;
+    #     has Mu $!topic;
+    #     has Mu $!slash;
 
     proto method ACCEPTS(|) {*}
     multi method ACCEPTS(Regex:D: Mu:U \a) {
@@ -81,6 +83,15 @@ my class Regex { # declared in BOOTSTRAP
     }
 
     multi method Bool(Regex:D:) {
+        my Mu \topic = $!topic;
+        nqp::istype_nd(topic, Rakudo::Internals::RegexBoolification6cMarker)
+            ?? self!Bool6c()
+            !! nqp::isconcrete(topic)
+                ?? ($!slash = topic.match(self)).Bool
+                !! False
+    }
+
+    method !Bool6c() {
         nqp::stmts(
           (my $ctx := nqp::ctx),
           nqp::until(
@@ -107,6 +118,12 @@ my class Regex { # declared in BOOTSTRAP
 
     multi method perl(Regex:D:) {
         nqp::ifnull($!source,'')
+    }
+
+    method clone(Mu :$topic is raw, Mu :$slash is raw --> Regex) {
+        nqp::p6bindattrinvres(
+            nqp::p6bindattrinvres(self.Method::clone, Regex, '$!topic', $topic),
+            Regex, '$!slash', $slash)
     }
 }
 

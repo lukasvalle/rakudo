@@ -24,7 +24,12 @@ my class DateTime does Dateish {
                   ($!timezone.abs/60%60).floor)
     }
 
+#?if moar
     my constant $valid-units = nqp::hash(
+#?endif
+#?if !moar
+    my $valid-units := nqp::hash(
+#?endif
       'second',  0,
       'seconds', 0,
       'minute',  0,
@@ -61,7 +66,6 @@ my class DateTime does Dateish {
         nqp::bind($!month,     month);
         nqp::bind($!day,       day);
         nqp::bind(&!formatter, &formatter);
-        nqp::bind($!daycount,  nqp::null);
         $!hour      := hour;
         $!minute    := minute;
         $!second    := second;
@@ -99,7 +103,8 @@ my class DateTime does Dateish {
                $year,$month,$day,$hour,$minute,$second,$timezone,&formatter)
           !! self.bless(
                :$year,:$month,:$day,
-               :$hour,:$minute,:$second,:$timezone,:&formatter,|%extra);
+               :$hour,:$minute,:$second,:$timezone,:&formatter,|%extra
+             )!SET-DAYCOUNT;
 
         $second >= 60 ?? $dt!check-leap-second !! $dt
     }
@@ -186,8 +191,9 @@ my class DateTime does Dateish {
                   !! nqp::create(self)!SET-SELF(
                     $year,$month,$day,$hour,$minute,$second,0,&formatter)
           ) !! self.bless(
-               :$year,:$month,:$day,
-               :$hour,:$minute,:$second,:timezone(0),:&formatter,|%_);
+                 :$year,:$month,:$day,
+                 :$hour,:$minute,:$second,:timezone(0),:&formatter,|%_
+               )!SET-DAYCOUNT;
         $timezone ?? $dt.in-timezone($timezone) !! $dt
     }
     multi method new(DateTime:

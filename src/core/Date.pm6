@@ -4,7 +4,12 @@ my class Date does Dateish {
         sprintf '%s-%02d-%02d',self!year-Str,$!month,$!day
     }
 
+#?if moar
     my constant $valid-units = nqp::hash(
+#?endif
+#?if !moar
+    my $valid-units := nqp::hash(
+#?endif
       'day',    1,
       'days',   1,
       'week',   7,
@@ -26,12 +31,7 @@ my class Date does Dateish {
         nqp::bind($!month,     month);
         nqp::bind($!day,       day);
         nqp::bind(&!formatter, formatter);
-        nqp::bind($!daycount,
-          nqp::isconcrete($daycount) ?? $daycount !! nqp::null);
-        self
-    }
-    method !SET-DAYCOUNT() {
-        nqp::bind($!daycount,nqp::null) unless nqp::isconcrete($!daycount);
+        nqp::bind($!daycount,$daycount) if nqp::isconcrete($!daycount);
         self
     }
 
@@ -220,17 +220,17 @@ my class Date does Dateish {
 }
 
 multi sub infix:<+>(Date:D $d, Int:D $x --> Date:D) {
-    nqp::eqaddr($d.WHAT,Date) && $d.day + $x <= 28
+    nqp::eqaddr($d.WHAT,Date) && 0 < $d.day + $x <= 28
       ?? $d.new-from-diff($x)
       !! Date.new-from-daycount($d.daycount + $x)
 }
 multi sub infix:<+>(Int:D $x, Date:D $d --> Date:D) {
-    nqp::eqaddr($d.WHAT,Date) && $d.day + $x <= 28
+    nqp::eqaddr($d.WHAT,Date) && 0 < $d.day + $x <= 28
       ?? $d.new-from-diff($x)
       !! Date.new-from-daycount($d.daycount + $x)
 }
 multi sub infix:<->(Date:D $d, Int:D $x --> Date:D) {
-    nqp::eqaddr($d.WHAT,Date) && $d.day - $x > 0
+    nqp::eqaddr($d.WHAT,Date) && 0 < $d.day - $x <= 28
       ?? $d.new-from-diff(-$x)
       !! Date.new-from-daycount($d.daycount - $x)
 }

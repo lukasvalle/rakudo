@@ -15,14 +15,22 @@ my $abbrev-block := 'abbreviated';
 # 2147483648 == 2**31. By adding 1 to it with add_i op, on 32-bit boxes it will overflow
 my int $?BITS := nqp::isgt_i(nqp::add_i(2147483648, 1), 0) ?? 64 !! 32;
 
-sub block_closure($code) {
-    QAST::Op.new( :op('p6capturelex'),
-      QAST::Op.new(
-        :op('callmethod'), :name('clone'),
-        $code)
+sub block_closure($code, :$regex) {
+    my $clone := QAST::Op.new( :op('callmethod'), :name('clone'), $code );
+    if $regex {
+        if $*W.lang-ver-before('d') {
+            my $marker := $*W.find_symbol(['Rakudo', 'Internals', 'RegexBoolification6cMarker']);
+            $clone.push(QAST::WVal.new( :value($marker), :named('topic') ));
+        }
+        else {
+            $clone.push(QAST::Var.new( :name('$_'), :scope('lexical'), :named('topic') ));
+            $clone.push(QAST::Var.new( :name('$/'), :scope('lexical'), :named('slash') ));
+        }
+    }
+    QAST::Op.new( :op('p6capturelex'), $clone ).annotate_self(
+        'past_block', $code.ann('past_block')
     ).annotate_self(
-      'past_block', $code.ann('past_block')
-    ).annotate_self('code_object', $code.ann('code_object'))
+        'code_object', $code.ann('code_object'))
 }
 
 sub wantall($ast, $by) {
@@ -1797,9 +1805,10 @@ class Perl6::Actions is HLL::Actions does STDActions {
         $past.push(QAST::WVal.new(:value($ret))) if nqp::isconcrete($ret) || $ret.HOW.name($ret) eq 'Nil';
         if %*HANDLERS {
             $past := QAST::Op.new( :op('handle'), $past );
-            for %*HANDLERS {
-                $past.push($_.key);
-                $past.push($_.value);
+            my %handlers := %*HANDLERS;
+            for sorted_keys(%handlers) {
+                $past.push($_);
+                $past.push(%handlers{$_});
             }
         }
         $past
@@ -2338,11 +2347,15 @@ class Perl6::Actions is HLL::Actions does STDActions {
     }
 
     method statement_prefix:sym<BEGIN>($/) {
-        begin_time_lexical_fixup($<blorst>.ast.ann('past_block'));
+        my $qast_block := $<blorst>.ast.ann('past_block');
+        begin_time_lexical_fixup($qast_block);
+        $qast_block.annotate('BEGINISH', 1);
         make $*W.add_phaser($/, 'BEGIN', wanted($<blorst>.ast,'BEGIN').ann('code_object'));
     }
     method statement_prefix:sym<CHECK>($/) {
-        begin_time_lexical_fixup($<blorst>.ast.ann('past_block'));
+        my $qast_block := $<blorst>.ast.ann('past_block');
+        begin_time_lexical_fixup($qast_block);
+        $qast_block.annotate('BEGINISH', 1);
         make $*W.add_phaser($/, 'CHECK', wanted($<blorst>.ast,'CHECK').ann('code_object'));
     }
     method statement_prefix:sym<COMPOSE>($/) { make $*W.add_phaser($/, 'COMPOSE', unwanted($<blorst>.ast,'COMPOSE').ann('code_object')); }
@@ -3362,6 +3375,9 @@ class Perl6::Actions is HLL::Actions does STDActions {
                     }
                 }
                 elsif $<initializer><sym> eq '=' {
+                    if $past.ann('init_removal') -> $remove {
+                        $remove();
+                    }
                     $past := assign_op($/, $past, $initast, :initialize);
                 }
                 elsif $<initializer><sym> eq '.=' {
@@ -3777,7 +3793,7 @@ class Perl6::Actions is HLL::Actions does STDActions {
 
             # Install the container.
             my $cont := $*W.install_lexical_container($BLOCK, $name, %cont_info, $descriptor,
-                :scope($*SCOPE), :package($package));
+                :scope($*SCOPE), :package($package), :init_removal($past));
 
             # Set scope and type on container, and if needed emit code to
             # reify a generic type or create a fresh container.
@@ -3901,15 +3917,15 @@ class Perl6::Actions is HLL::Actions does STDActions {
                 $block.push(WANTED($<statementlist>.ast,'&def'));
                 $block.node($/);
             }
-            if is_clearly_returnless($block) {
+            if $*MAY_USE_RETURN {
+                $block[1] := wrap_return_handler($block[1]);
+            }
+            else {
                 $block[1] := QAST::Op.new(
                     :op(decontrv_op()),
                     QAST::WVal.new( :value($*DECLARAND) ),
                     $block[1]);
                 $block[1] := wrap_return_type_check($block[1], $*DECLARAND);
-            }
-            else {
-                $block[1] := wrap_return_handler($block[1]);
             }
         }
         $block.blocktype('declaration_static');
@@ -4336,15 +4352,15 @@ class Perl6::Actions is HLL::Actions does STDActions {
         }
         else {
             $past := WANTED($<blockoid>.ast,'method_def');
-            if is_clearly_returnless($past) {
+            if $*MAY_USE_RETURN {
+                $past[1] := wrap_return_handler($past[1]);
+            }
+            else {
                 $past[1] := QAST::Op.new(
                     :op(decontrv_op()),
                     QAST::WVal.new( :value($*DECLARAND) ),
                     $past[1]);
                 $past[1] := wrap_return_type_check($past[1], $*DECLARAND);
-            }
-            else {
-                $past[1] := wrap_return_handler($past[1]);
             }
         }
         $past.blocktype('declaration_static');
@@ -4649,54 +4665,6 @@ class Perl6::Actions is HLL::Actions does STDActions {
         }
     }
 
-    sub is_clearly_returnless($block) {
-        sub returnless_past($past) {
-            return 0 unless
-                # It's a simple operation.
-                nqp::istype($past, QAST::Op)
-                    && $past.op ne 'callmethod' # May be .return or similar
-                    && nqp::getcomp('QAST').operations.is_inlinable('perl6', $past.op) ||
-                # A QAST::Stmt node
-                nqp::istype($past, QAST::Stmt) ||
-                # Just a variable lookup.
-                nqp::istype($past, QAST::Var) ||
-                # Just a QAST::Want
-                nqp::istype($past, QAST::Want) ||
-                # Just a primitive or world value.
-                nqp::istype($past, QAST::WVal) ||
-                nqp::istype($past, QAST::IVal) ||
-                nqp::istype($past, QAST::NVal) ||
-                nqp::istype($past, QAST::SVal);
-            for @($past) {
-                if nqp::istype($_, QAST::Node) {
-                    if !returnless_past($_) {
-                        return 0;
-                    }
-                }
-            }
-            1;
-        }
-
-        # Ensure second node is QAST::Stmts.
-        return 0 unless nqp::istype($block[1], QAST::Stmts);
-
-        # Ensure there's no nested blocks.
-        for @($block[0]) {
-            if nqp::istype($_, QAST::Block) { return 0; }
-            if nqp::istype($_, QAST::Stmts) {
-                for @($_) {
-                    if nqp::istype($_, QAST::Block) { return 0; }
-                }
-            }
-        }
-
-        # Check the block content.
-        for @($block[1]) {
-            return 0 unless returnless_past($_);
-        }
-        return 1;
-    }
-
     sub is_yada($/) {
         if $<blockoid><statementlist> && +$<blockoid><statementlist><statement> == 1 {
             my $btxt := ~$<blockoid><statementlist><statement>[0];
@@ -4792,7 +4760,7 @@ class Perl6::Actions is HLL::Actions does STDActions {
         }
 
         # Return closure if not in sink context.
-        make block_closure($coderef).annotate_self(
+        make block_closure($coderef, :regex).annotate_self(
             'sink_ast', QAST::Op.new( :op('null') ))
     }
 
@@ -5189,6 +5157,7 @@ class Perl6::Actions is HLL::Actions does STDActions {
         }
         else {
             $con_block.push($value_ast);
+            $con_block.annotate('BEGINISH', 1);
             my $value_thunk := $W.create_code_obj_and_add_child($con_block, 'Block');
             $value := $W.handle-begin-time-exceptions($/, 'evaluating a constant', $value_thunk);
             $*W.add_constant_folded_result($value);
@@ -6509,35 +6478,43 @@ class Perl6::Actions is HLL::Actions does STDActions {
         }
     }
 
-    sub hunt_loose_adverbs_in_arglist($/, @past) {
-        # if we have a non-comma-separated list of adverbial pairs in an
-        # arglist or semiarglist, only the first will be passed as a named
-        # argument.
-
-        # Thus, we need to find chained adverbs. They show up on the parse
-        # tree as colonpair rules followed by a fake_infix.
-
-        # if nqp::getenvhash<COLONPAIR> eq 'trace' { say($/.dump) }
-        if +$/.list == 1 && nqp::istype($/[0].ast, QAST::Op) && $/[0].ast.op eq 'call' && $/[0].ast.name ne 'infix:<,>' {
-            nqp::die("these adverbs belong to a deeper-nested thing");
-        }
-        if $<fake_infix>
-               || $<colonpair> && +($/.list) == 0 && +($/.hash) == 1 {
-            if +($/.list) == 1 {
-                hunt_loose_adverbs_in_arglist($/[0], @past);
-            }
-            my $Pair := $*W.find_symbol(['Pair']);
-            if $<colonpair> && istype($<colonpair>.ast.returns, $Pair) {
-                if $*WAS_SKIPPED {
-                    nqp::push(@past, $<colonpair>.ast);
-                } else {
-                    $*WAS_SKIPPED := 1;
+    sub migrate_colonpairs($/, @qast) {
+        my $Pair := $*W.find_symbol(['Pair']);
+        my $ridx1 := 0;
+        my $sidx1 := 1;
+        while $ridx1 < +@qast {
+            my $ridx2 := 3;
+            my $q := @qast[$ridx1];
+            if nqp::istype($q, QAST::Op) && $q.op eq 'callmethod' && $q.name eq 'new' && nqp::istype($q[0], QAST::Var) && $q[0].name eq 'Pair' {
+                while $ridx2 < +@(@qast[$ridx1]) {
+                    my $clone := @(@qast[$ridx1])[$ridx2].shallow_clone;
+                    nqp::splice(
+                        @qast,
+                        nqp::list(wanted(QAST::Op.new(
+                            :op('callmethod'), :name('new'), :returns($Pair), :node($clone.node // $/),
+                            QAST::Var.new( :name('Pair'), :scope('lexical'), :node($clone.node // $/)),
+                            $*W.add_string_constant($clone.named),
+                            $clone
+                        ), 'circumfix()/pair')),
+                        $sidx1,
+                        0);
+                    $clone.named(NQPMu);
+                    $sidx1++;
+                    $ridx2++;
+                }
+                if $ridx2 > 3 {
+                    nqp::splice(@qast[$ridx1], nqp::list, 3, +@(@qast[$ridx1]) - 3);
+                    $ridx1 := $sidx1;
+                    $sidx1++;
+                }
+                else {
+                    $ridx1++;
+                    $sidx1++;
                 }
             }
-        } elsif $<OPER>.Str eq ',' {
-           my $*WAS_SKIPPED := 0;
-            for $/.list {
-                hunt_loose_adverbs_in_arglist($_, @past);
+            else {
+                $ridx1++;
+                $sidx1++;
             }
         }
     }
@@ -6576,11 +6553,8 @@ class Perl6::Actions is HLL::Actions does STDActions {
             }
 
             # but first, look for any chained adverb pairs
-            my $*WAS_SKIPPED := 0;
-            try {
-                if $*FAKE_INFIX_FOUND {
-                    hunt_loose_adverbs_in_arglist($<EXPR>, @args);
-                }
+            if $*FAKE_INFIX_FOUND {
+                migrate_colonpairs($/, @args);
             }
             my %named_counts;
             for @args {
@@ -6638,45 +6612,52 @@ class Perl6::Actions is HLL::Actions does STDActions {
     method term:sym<value>($/) { make $<value>.ast; }
 
     method circumfix:sym<( )>($/) {
+        my $Pair := $*W.find_symbol(['Pair']);
         my $past := $<semilist>.ast;
-        my @args;
-        # look for any chained adverb pairs
-        if $<semilist><statement>[0]<EXPR> -> $EXPR {
-            my $*WAS_SKIPPED := 0;
-            try {
-                if $*FAKE_INFIX_FOUND {
-                    hunt_loose_adverbs_in_arglist($EXPR, @args);
-                }
-                for @args {
-                    $_[2] := QAST::Want.new(|$_[2].list);
-                }
-            }
-        }
-        my $size := +$past.list;
-        if $size == 0 {
+
+        if !+$past.list {
             $past := QAST::Stmts.new( :node($/) );
             $past.push(QAST::Op.new( :op('call'), :name('&infix:<,>'), :node($/)));
         }
-        elsif +@args {
-            if $size == 1
-            && nqp::istype($past[0],    QAST::Op)  && $past[0].op eq 'callmethod' && $past[0].name eq 'new'
-            && nqp::istype($past[0][0], QAST::Var) && $past[0][0].name eq 'Pair' {
-                $past := wanted(QAST::Stmts.new( :node($/),
-                    QAST::Op.new( :op('call'), :name('&infix:<,>'),
-                        QAST::Op.new(
-                            :op('callmethod'), :name('new'), :returns($*W.find_symbol(['Pair'])), :node($past[0].node // $/),
-                            QAST::Var.new( :name('Pair'), :scope('lexical'), :node($past[0].node // $/) ),
-                            $past[0][1], $past[0][2]
-                        ),
-                        |@args
-                    )
-                ), 'circumfix()/pair');
+        # Look for any chained adverb pairs and relocate them.
+        # Try to reuse existing QAST where possible.
+        elsif $*FAKE_INFIX_FOUND {
+            my $numsemis := +$<semilist><statement>;
+            if $numsemis > 1 {
+                $past := QAST::Stmts.new( :node($/) );
+                $past.push(QAST::Op.new( :op('call'), :name('&infix:<,>'), :node($/)));
             }
-            else {
-                for @args {
-                    $past.push(wanted($_, 'circumfix()/args'));
+            my $semi := 0;
+            repeat until $semi >= $numsemis {
+                my $EXPR := $<semilist><statement>[$semi]<EXPR> //
+                    nqp::die("internal problem: parser did not give circumfix an EXPR");
+                if $EXPR<colonpair> { # might start with a colonpair
+                    my @fan := nqp::list($EXPR.ast);
+                    migrate_colonpairs($/, @fan);
+                    if (+@fan > 1) {
+                        my $comma := QAST::Op.new( :op('call'), :name('&infix:<,>'), :node($/));
+                        for @fan { $comma.push($_) }
+                        if ($numsemis == 1) {
+                            $past := QAST::Stmts.new( :node($/) );
+                            $past.push($comma);
+                        }
+                        else {
+                            $past[0].push($comma);
+                        }
+                    }
+                    elsif ($numsemis > 1) {
+                        $past[0].push($EXPR.ast);
+                    }
                 }
+                else {
+                    migrate_colonpairs($/, $EXPR.ast.list);
+                    if ($numsemis > 1) {
+                        $past[0].push($EXPR.ast);
+                    }
+                }
+                $semi++;
             }
+            $past := wanted($past, 'circumfix()/pair');
         }
         make $past;
     }
@@ -6793,33 +6774,39 @@ class Perl6::Actions is HLL::Actions does STDActions {
                 :node($/)
             );
             if $has_stuff {
-                for @children {
-                    if nqp::istype($_, QAST::Stmt) {
+                my $c := 0; # follow $p in the match tree
+                for @children -> $p {
+                    my $pp := $p;
+                    if nqp::istype($p, QAST::Stmt) {
                         # Mustn't use QAST::Stmt here, as it will cause register
                         # re-use within a statement, which is a problem.
-                        $_ := QAST::Stmts.new( |$_.list );
+                        $p := QAST::Stmts.new( |$p.list );
                     }
-                    $past.push($_);
-                }
-                # look for any chained adverb pairs
-                if $<pblock><blockoid><statementlist><statement>[0]<EXPR> -> $EXPR {
-                    my $*WAS_SKIPPED := 0;
-                    try {
-                        my @args;
-                        if $*FAKE_INFIX_FOUND {
-                            hunt_loose_adverbs_in_arglist($EXPR, @args);
+                    # Look for any chained adverb pairs and relocate them.
+                    # Try to reuse existing QAST where possible.
+                    if $*FAKE_INFIX_FOUND {
+                        $pp := nqp::istype($p[0], QAST::Want) ?? $pp[0][0] !! $pp[0];
+                        if $<pblock><blockoid><statementlist><statement>[$c]<EXPR><colonpair> {
+                            my @fan := nqp::list($pp);
+                            migrate_colonpairs($/, @fan);
+                            if (+@fan > 1) {
+                                $pp := QAST::Op.new( :op('call'), :name('&infix:<,>'), :node($/));
+                                for @fan { $pp.push($_) }
+                            }
                         }
-                        for @args {
-                            $_[2] := QAST::Want.new(|$_[2].list);
-                            $past.push(
-                                QAST::Op.new(
-                                    :op('callmethod'), :name('new'), :returns($*W.find_symbol(['Pair'])), :node($_.node // $/),
-                                    QAST::Var.new( :name('Pair'), :scope('lexical'), :node($_.node // $/) ),
-                                    $_[1], $_[2]
-                                )
-                            );
+                        else {
+                            migrate_colonpairs($/, $pp.list);
                         }
+                        if nqp::istype($p, QAST::Want) {
+                            $p[0][0] := $pp;
+                        }
+                        else {
+                            $p[0] := $pp;
+                        }
+                        $pp := $p;
                     }
+                    $past.push($pp);
+                    $c++;
                 }
             }
             # Clear out the now-unused QAST::Block, so we don't leave it behind in
@@ -6873,7 +6860,56 @@ class Perl6::Actions is HLL::Actions does STDActions {
     }
 
     method circumfix:sym<[ ]>($/) {
-        make QAST::Op.new( :op('call'), :name('&circumfix:<[ ]>'), $<semilist>.ast, :node($/) );
+
+        my $Pair := $*W.find_symbol(['Pair']);
+        my $past := $<semilist>.ast;
+
+        if !+$past.list {
+            $past := QAST::Stmts.new( :node($/) );
+            $past.push(QAST::Op.new( :op('call'), :name('&infix:<,>'), :node($/)));
+        }
+        # Look for any chained adverb pairs and relocate them.
+        # Try to reuse existing QAST where possible.
+        elsif $*FAKE_INFIX_FOUND {
+            my $numsemis := +$<semilist><statement>;
+            if $numsemis > 1 {
+                $past := QAST::Stmts.new( :node($/) );
+                $past.push(QAST::Op.new( :op('call'), :name('&infix:<,>'), :node($/)));
+            }
+            my $semi := 0;
+            repeat until $semi >= $numsemis {
+                my $EXPR := $<semilist><statement>[$semi]<EXPR> //
+                    nqp::die("internal problem: parser did not give circumfix an EXPR");
+                if $EXPR<colonpair> { # might start with a colonpair
+                    my @fan := nqp::list($EXPR.ast);
+                    migrate_colonpairs($/, @fan);
+                    if (+@fan > 1) {
+                        my $comma := QAST::Op.new( :op('call'), :name('&infix:<,>'), :node($/));
+                        for @fan { $comma.push($_) }
+                        if ($numsemis == 1) {
+                            $past := QAST::Stmts.new( :node($/) );
+                            $past.push($comma);
+                        }
+                        else {
+                            $past[0].push($comma);
+                        }
+                    }
+                    elsif ($numsemis > 1) {
+                        $past[0].push($EXPR.ast);
+                    }
+                }
+                else {
+                    migrate_colonpairs($/, $EXPR.ast.list);
+                    if ($numsemis > 1) {
+                        $past[0].push($EXPR.ast);
+                    }
+                }
+                $semi++;
+            }
+            $past := wanted($past, 'circumfix[]/pair');
+        }
+
+        make QAST::Op.new( :op('call'), :name('&circumfix:<[ ]>'), $past, :node($/) );
     }
 
     ## Expressions
@@ -8275,7 +8311,6 @@ class Perl6::Actions is HLL::Actions does STDActions {
     }
 
     method bare_complex_number($/) {
-        my $Num := $*W.find_symbol: ['Num'], :setting-only;
         my $ast := $*W.add_constant: 'Complex', 'type_new', :nocache(1),
             $*W.add_constant('Num', 'num',
                 $<re><sign> eq '-' || $<re><sign> eq '−'
@@ -8486,7 +8521,7 @@ class Perl6::Actions is HLL::Actions does STDActions {
         my $coderef := regex_coderef($/, $*W.stub_code_object('Regex'),
             $<nibble>.ast, 'anon', '', %sig_info, $block, :use_outer_match(1)) if $<nibble>.ast;
         # Return closure if not in sink context.
-        my $closure := block_closure($coderef);
+        my $closure := block_closure($coderef, :regex);
         $closure.annotate('sink_ast', QAST::Op.new( :op<callmethod>, :name<Bool>, $closure));
         make $closure;
     }
@@ -8497,7 +8532,7 @@ class Perl6::Actions is HLL::Actions does STDActions {
         my %sig_info := hash(parameters => []);
         my $coderef := regex_coderef($/, $*W.stub_code_object('Regex'),
             $<quibble>.ast, 'anon', '', %sig_info, $block, :use_outer_match(1)) if $<quibble>.ast;
-        my $past := block_closure($coderef);
+        my $past := block_closure($coderef, :regex);
         $past.annotate('sink_ast', QAST::Op.new(:op<callmethod>, :name<Bool>, $past));
         make $past;
     }
@@ -8511,7 +8546,7 @@ class Perl6::Actions is HLL::Actions does STDActions {
             :node($/),
             :op('callmethod'), :name('match'),
             WANTED(QAST::Var.new( :name('$_'), :scope('lexical') ),'m'),
-            block_closure($coderef)
+            block_closure($coderef, :regex)
         );
         if self.handle_and_check_adverbs($/, %MATCH_ALLOWED_ADVERBS, 'm', $past) {
             # if this match returns a list of matches instead of a single
